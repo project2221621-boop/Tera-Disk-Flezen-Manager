@@ -229,7 +229,15 @@ async def cmd_report(e):
 # ---------- main ----------
 async def main():
     if not PIPELINES:
-        raise SystemExit("Koi pipeline configure nahi hai (TERA_CONVERTER/TERA_DEST etc.)")
+        seen = {
+            k: ("set" if os.getenv(k, "").strip() else "EMPTY")
+            for k in os.environ
+            if any(x in k.upper() for x in ("TERA", "DISK", "FLEZEN", "CONVERTER", "DEST"))
+        }
+        raise SystemExit(
+            "Koi pipeline nahi mili. Expected: TERA_CONVERTER + TERA_DEST (ya DISK_*/FLEZEN_*). "
+            f"Railway me ye matching vars dikh rahe hain: {seen or 'KOI NAHI'}"
+        )
 
     await user.connect()
     if not await user.is_user_authorized():
