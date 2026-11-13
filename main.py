@@ -24,7 +24,14 @@ PIPELINES = {}
 for _n in ("tera", "disk", "flezen"):
     _conv, _dest = os.getenv(f"{_n.upper()}_CONVERTER"), os.getenv(f"{_n.upper()}_DEST")
     if _conv and _dest:
-        PIPELINES[_n] = {"converter": _conv, "dest": int(_dest), "conv_id": None}
+        _dest = _dest.strip()
+        _is_id = _dest.lstrip("-").isdigit()
+        PIPELINES[_n] = {
+            "converter": _conv.strip(),
+            "dest": int(_dest) if _is_id else _dest,  # numeric id (channel) or @username (bot)
+            "via_user": not _is_id,  # bots can't message bots, so userbot sends to a bot dest
+            "conv_id": None,
+        }
 
 user = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 bot = TelegramClient("bot_session", API_ID, API_HASH)
@@ -122,7 +129,9 @@ async def on_reply(event):
         return
     dest = PIPELINES[p]["dest"]
     try:
-        if msg.photo or msg.document:
+        if PIPELINES[p]["via_user"]:
+            await user.send_message(dest, msg)  # re-sends text + media as-is
+        elif msg.photo or msg.document:
             buf = io.BytesIO()
             await user.download_media(msg, file=buf)
             buf.seek(0)
