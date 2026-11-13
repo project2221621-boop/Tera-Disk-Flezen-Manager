@@ -4,7 +4,7 @@ import logging
 import os
 from collections import defaultdict, deque
 
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, events, functions, types, utils
 from telethon.sessions import StringSession
 
 import db
@@ -21,13 +21,27 @@ ADMIN_IDS = {int(x) for x in os.environ["ADMIN_IDS"].split(",") if x.strip()}
 
 # per pipeline: <NAME>_CONVERTER (@username of converter bot), <NAME>_DEST (channel id)
 PIPELINES = {}
+ENV_SRC = {}  # pipeline -> raw tokens from <NAME>_SOURCE_CHANNELS
+ENV_SOURCES = defaultdict(set)  # chat_id -> {pipeline}, resolved at startup
+
+
+def _env(*names):
+    for n in names:
+        v = os.getenv(n, "").strip()
+        if v:
+            return v
+    return ""
+
+
 for _n in ("tera", "disk", "flezen"):
-    _conv, _dest = os.getenv(f"{_n.upper()}_CONVERTER"), os.getenv(f"{_n.upper()}_DEST")
+    _N = _n.upper()
+    _conv = _env(f"{_N}_CONVERTER_BOT", f"{_N}_CONVERTER")
+    _dest = _env(f"{_N}_DESTINATION", f"{_N}_DEST")
+    ENV_SRC[_n] = _env(f"{_N}_SOURCE_CHANNELS").replace(",", " ").split()
     if _conv and _dest:
-        _dest = _dest.strip()
         _is_id = _dest.lstrip("-").isdigit()
         PIPELINES[_n] = {
-            "converter": _conv.strip(),
+            "converter": int(_conv) if _conv.lstrip("-").isdigit() else _conv,
             "dest": int(_dest) if _is_id else _dest,  # numeric id (channel) or @username (bot)
             "via_user": not _is_id,  # bots can't message bots, so userbot sends to a bot dest
             "conv_id": None,
@@ -71,6 +85,8 @@ async def sync_sources() -> bool:
         cid = int(r["chat_id"])
         new[cid].add(r["pipeline"])
         t[cid] = r.get("title") or str(cid)
+    for cid, ps in ENV_SOURCES.items():
+        new[cid] |= ps
     if new == sources:
         return False
     sources.clear()
@@ -235,7 +251,7 @@ async def main():
             if any(x in k.upper() for x in ("TERA", "DISK", "FLEZEN", "CONVERTER", "DEST"))
         }
         raise SystemExit(
-            "Koi pipeline nahi mili. Expected: TERA_CONVERTER + TERA_DEST (ya DISK_*/FLEZEN_*). "
+            "Koi pipeline nahi mili. Expected: <TERA|DISK|FLEZEN>_CONVERTER_BOT + _DESTINATION. "
             f"Railway me ye matching vars dikh rahe hain: {seen or 'KOI NAHI'}"
         )
 
@@ -247,6 +263,23 @@ async def main():
 
     for c in PIPELINES.values():
         c["conv_id"] = (await user.get_entity(c["converter"])).id
+    for p, toks in ENV_SRC.items():
+        if p not in PIPELINES:
+            continue
+        for t in toks:
+            try:
+                cid = int(t) if t.lstrip("-").isdigit() else utils.get_peer_id(await user.get_entity(t))
+            except Exception:
+                log.warning("Env source %r (%s) resolve nahi hua", t, p)
+                continue
+            ENV_SOURCES[cid].add(p)
+            try:
+                titles[cid] = await resolve_title(cid)
+            except Exception:
+                titles[cid] = str(cid)
+    for cid, ps in ENV_SOURCES.items():
+        sources[cid] |= ps  # works even if Supabase is down
+
     user.add_event_handler(
         on_reply,
         events.NewMessage(from_users=[c["conv_id"] for c in PIPELINES.values()], incoming=True),
