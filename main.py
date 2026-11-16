@@ -47,6 +47,11 @@ for _n in ("tera", "disk", "flezen"):
             "conv_id": None,
         }
 
+SEND_DELAY = float(os.getenv("SEND_DELAY", "2.5"))  # gap between sends to a converter
+POST_DELAY = float(os.getenv("POST_DELAY", "3"))  # gap between posts to a destination
+conv_locks = defaultdict(asyncio.Lock)  # one queue per converter (FIFO, keeps order)
+post_locks = defaultdict(asyncio.Lock)  # one queue per destination
+
 user = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 bot = TelegramClient("bot_session", API_ID, API_HASH)
 
@@ -129,9 +134,11 @@ async def on_source(event):
         if p not in PIPELINES or dup(("src", p, event.chat_id, msg.id)):
             continue
         try:
-            await user.send_message(PIPELINES[p]["converter"], msg)
+            conv = PIPELINES[p]["converter"]
+            async with conv_locks[conv]:
+                await user.send_message(conv, msg)
+                await asyncio.sleep(SEND_DELAY)
             stats[p]["in"] += 1
-            await asyncio.sleep(1.5)  # gentle on flood limits
         except Exception:
             stats[p]["err"] += 1
             log.exception("send to converter failed (%s)", p)
@@ -145,18 +152,20 @@ async def on_reply(event):
         return
     dest = PIPELINES[p]["dest"]
     try:
-        if PIPELINES[p]["via_user"]:
-            await user.send_message(dest, msg)  # re-sends text + media as-is
-        elif msg.photo or msg.document:
-            buf = io.BytesIO()
-            await user.download_media(msg, file=buf)
-            buf.seek(0)
-            buf.name = "file.jpg" if msg.photo else (msg.file.name or "file")
-            await bot.send_file(dest, buf, caption=msg.text or "", formatting_entities=msg.entities)
-        elif msg.text:
-            await bot.send_message(dest, msg.text, formatting_entities=msg.entities, link_preview=False)
-        else:
-            return
+        async with post_locks[dest]:
+            if PIPELINES[p]["via_user"]:
+                await user.send_message(dest, msg)  # re-sends text + media as-is
+            elif msg.photo or msg.document:
+                buf = io.BytesIO()
+                await user.download_media(msg, file=buf)
+                buf.seek(0)
+                buf.name = "file.jpg" if msg.photo else (msg.file.name or "file")
+                await bot.send_file(dest, buf, caption=msg.text or "", formatting_entities=msg.entities)
+            elif msg.text:
+                await bot.send_message(dest, msg.text, formatting_entities=msg.entities, link_preview=False)
+            else:
+                return
+            await asyncio.sleep(POST_DELAY)
         stats[p]["out"] += 1
     except Exception:
         stats[p]["err"] += 1
