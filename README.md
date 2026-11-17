@@ -1,4 +1,4 @@
-# XVIP Hybrid Bot
+# Tera Disk Flezen Manager
 
 Telegram multi-pipeline forwarding system: **Telethon userbot + bot client**.
 Pipelines: **Tera**, **Disk**, **Flezen**.
@@ -116,16 +116,35 @@ Phone number, OTP aur 2FA password terminal me poochega. Ye string account ka fu
 
 ## Admin commands
 
+Sirf `ADMIN_IDS` wale users, bot ke private chat me.
+
 | Command | Kaam |
 |---|---|
-| `/addsource <pipeline> <chat_id>` | Naya source jodta hai (Supabase me save, handler turant reload) |
-| `/delsource <pipeline> <chat_id>` | Source hatata hai |
-| `/sources` | Saare sources dikhata hai |
-| `/report` | Live status: sources, In / Out / Skip / Err, Queue, DB aur userbot status |
+| `/start` | Menu + Userbot Status (🟢 Connected / 🔴 Disconnected) |
+| `/status` | Account/login status: userbot account, bot, database, pipelines, uptime |
+| `/report` | Live status of all source channels: ✅ live / ❌ deleted, messages seen, last message time; pipeline-wise In / Out / Skip / Err / Queue |
+| `/tera_add` `/tera_remove` `/tera_list` | Tera sources manage karo |
+| `/disk_add` `/disk_remove` `/disk_list` | Disk sources manage karo |
+| `/flezen_add` `/flezen_remove` `/flezen_list` | Flezen sources manage karo |
 
-Example: `/addsource tera -1001234567890`
+**Source status icons** (`/report` aur `_list` dono me; IDs monospace me, tap karke copy ho jati hain):
 
-`*_SOURCE_CHANNELS` env wale sources har restart par wapas load hote hain. Unhe hatane ke liye Railway variable se nikalo (`/delsource` se sirf Supabase wale hat'te hain).
+- ✅ Live: userbot channel padh pa raha hai
+- ❌ Deleted: channel delete ho gaya, ya userbot hata diya gaya / ban ho gaya (live sources upar, deleted neeche)
+- ⚠️ Temporary check fail (timeout/network). 60 sec baad dobara check hota hai
+
+Add/remove me chat ID (`-100...`) ya `@username`, dono chalte hain:
+
+```
+/tera_add -1001234567890
+/disk_add @my_source_channel
+/flezen_remove -1005555555555
+/tera_list
+```
+
+Add karte hi source Supabase me save hota hai aur handler turant reload hota hai (restart nahi chahiye). Ye saari commands bot ke menu me bhi dikhti hain.
+
+`*_SOURCE_CHANNELS` env wale sources har restart par wapas load hote hain. Unhe `_remove` se nahi hata sakte, Railway variable se nikalo.
 
 ## Behaviour
 
