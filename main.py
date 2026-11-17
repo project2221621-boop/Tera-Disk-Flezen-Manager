@@ -64,6 +64,9 @@ sources = defaultdict(set)  # chat_id -> {pipeline}
 titles = {}
 stats = defaultdict(lambda: {"in": 0, "out": 0, "skip": 0, "err": 0})
 handlers = []  # (callback, event) currently attached to userbot
+src_seen = defaultdict(int)  # chat_id -> messages seen
+src_last = {}  # chat_id -> unix time of last message
+START_TS = time.time()
 
 _seen, _seen_set = deque(maxlen=5000), set()
 
@@ -177,6 +180,8 @@ async def with_retry(fn, what: str, attempts: int = 6):
 
 async def on_source(event):
     msg = event.message
+    src_seen[event.chat_id] += 1
+    src_last[event.chat_id] = time.time()
     for p in list(sources.get(event.chat_id, ())):
         if p not in PIPELINES or dup(("src", p, event.chat_id, msg.id)):
             continue
@@ -279,65 +284,198 @@ async def resolve_title(cid: int):
     return getattr(ent, "title", None) or str(cid)
 
 
+ALL_PIPELINES = ("tera", "disk", "flezen")
+COMMANDS = [("start", "Menu"), ("status", "Account/login status"), ("report", "Live status of all sources")]
+for _p in ALL_PIPELINES:
+    COMMANDS += [
+        (f"{_p}_add", f"Add {_p.title()} source"),
+        (f"{_p}_remove", f"Remove {_p.title()} source"),
+        (f"{_p}_list", f"List {_p.title()} sources"),
+    ]
+
+_ok_cache = {}  # chat_id -> (ts, ok)
+
+
+def fmt_dur(sec: float) -> str:
+    sec = int(sec)
+    d, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    m, _ = divmod(r, 60)
+    return (f"{d}d " if d else "") + (f"{h}h " if h else "") + f"{m}m"
+
+
+async def reply_long(e, text: str):
+    """Plain text (no markdown: titles/underscores stay safe), split under Telegram's 4096 limit."""
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 3900:
+            await e.reply(chunk, parse_mode=None)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await e.reply(chunk, parse_mode=None)
+
+
+async def userbot_ok() -> bool:
+    try:
+        return user.is_connected() and await user.is_user_authorized()
+    except Exception:
+        return False
+
+
+async def source_ok(cid: int) -> bool:
+    """Can the userbot still read this source? (cached 60s so /report can't spam the API)"""
+    ts, ok = _ok_cache.get(cid, (0, False))
+    if time.time() - ts < 60:
+        return ok
+    try:
+        await asyncio.wait_for(user.get_messages(cid, limit=1), 10)
+        ok = True
+    except Exception:
+        ok = False
+    _ok_cache[cid] = (time.time(), ok)
+    return ok
+
+
+async def parse_chat(tok: str) -> int:
+    """Numeric id or @username -> chat id the handlers match on."""
+    if tok.lstrip("-").isdigit():
+        return int(tok)
+    try:
+        ent = await user.get_entity(tok)
+    except ValueError:
+        await user.get_dialogs()
+        ent = await user.get_entity(tok)
+    return utils.get_peer_id(ent)
+
+
 @bot.on(events.NewMessage(pattern=r"^/start", func=is_admin))
 async def cmd_start(e):
+    status = "🟢 Connected" if await userbot_ok() else "🔴 Disconnected"
     await e.reply(
         "XVIP Hybrid Bot\n\n"
-        "/addsource <pipeline> <chat_id>\n/delsource <pipeline> <chat_id>\n"
-        "/sources\n/report\n\nPipelines: " + ", ".join(PIPELINES)
+        f"Userbot Status: {status}\n\n"
+        "Commands:\n"
+        "/status — account/login status\n"
+        "/report — live status of all source channels\n\n"
+        "/tera_add /tera_remove /tera_list — manage Tera sources\n"
+        "/disk_add /disk_remove /disk_list — manage Disk sources\n"
+        "/flezen_add /flezen_remove /flezen_list — manage Flezen sources",
+        parse_mode=None,
     )
 
 
-@bot.on(events.NewMessage(pattern=r"^/addsource(?:@\w+)?\s+(\w+)\s+(-?\d+)", func=is_admin))
-async def cmd_add(e):
-    p, cid = e.pattern_match.group(1).lower(), int(e.pattern_match.group(2))
-    if p not in PIPELINES:
-        return await e.reply(f"Pipeline galat. Options: {', '.join(PIPELINES)}")
+@bot.on(events.NewMessage(pattern=r"^/status", func=is_admin))
+async def cmd_status(e):
+    ok = await userbot_ok()
+    lines = [f"Userbot: {'🟢 Connected' if ok else '🔴 Disconnected'}"]
+    if ok:
+        try:
+            me = await user.get_me()
+            name = " ".join(x for x in (me.first_name, me.last_name) if x) or "-"
+            lines.append(f"Account: {name}" + (f" (@{me.username})" if me.username else "") + f" | id {me.id}")
+        except Exception:
+            pass
     try:
-        title = await resolve_title(cid)
+        lines.append(f"Bot: @{(await bot.get_me()).username}")
     except Exception:
-        return await e.reply("Userbot is channel me nahi hai ya ID galat hai.")
-    if not await db.upsert_source(cid, p, title):
-        return await e.reply("Supabase error, baad me try karo.")
-    sources[cid].add(p)
-    titles[cid] = title
-    await reload_handlers()
-    await e.reply(f"✅ {title} → {p}")
-
-
-@bot.on(events.NewMessage(pattern=r"^/delsource(?:@\w+)?\s+(\w+)\s+(-?\d+)", func=is_admin))
-async def cmd_del(e):
-    p, cid = e.pattern_match.group(1).lower(), int(e.pattern_match.group(2))
-    if not await db.delete_source(cid, p):
-        return await e.reply("Supabase error, baad me try karo.")
-    sources[cid].discard(p)
-    if not sources[cid]:
-        sources.pop(cid, None)
-    await reload_handlers()
-    await e.reply(f"🗑 Removed {cid} from {p}")
-
-
-@bot.on(events.NewMessage(pattern=r"^/sources", func=is_admin))
-async def cmd_sources(e):
-    if not sources:
-        return await e.reply("Koi source nahi hai.")
-    await e.reply("\n".join(f"{titles.get(c, c)} (`{c}`) → {', '.join(sorted(ps))}" for c, ps in sources.items()))
+        pass
+    lines.append(f"Database: {'🟢 OK' if db.ok else '🔴 DOWN'}")
+    lines.append("Pipelines: " + (", ".join(PIPELINES) or "none"))
+    lines.append(f"Sources: {len(sources)}")
+    lines.append(f"Uptime: {fmt_dur(time.time() - START_TS)}")
+    await e.reply("\n".join(lines), parse_mode=None)
 
 
 @bot.on(events.NewMessage(pattern=r"^/report", func=is_admin))
 async def cmd_report(e):
+    now = time.time()
     out = []
     for p, c in PIPELINES.items():
-        srcs = [titles.get(cid, str(cid)) for cid, ps in sources.items() if p in ps]
         s = stats[p]
+        q = conv_q[c["converter"]].qsize() + post_q[c["dest"]].qsize()
         out.append(
-            f"**{p.upper()}** → `{c['dest']}`\n"
-            f"Sources ({len(srcs)}): {', '.join(srcs) or '—'}\n"
-            f"In {s['in']} | Out {s['out']} | Skip {s['skip']} | Err {s['err']} | "
-            f"Queue {conv_q[c['converter']].qsize() + post_q[c['dest']].qsize()}"
+            f"━━ {p.upper()} ━━\n→ {c['dest']}\n"
+            f"In {s['in']} | Out {s['out']} | Skip {s['skip']} | Err {s['err']} | Queue {q}"
         )
-    out.append(f"DB: {'OK' if db.ok else 'DOWN'} | Userbot: {'OK' if user.is_connected() else 'DOWN'}")
-    await e.reply("\n\n".join(out))
+        srcs = [cid for cid, ps in sources.items() if p in ps]
+        if not srcs:
+            out.append("(koi source nahi)")
+        for cid in srcs:
+            last = src_last.get(cid)
+            ago = f"{fmt_dur(now - last)} ago" if last else "abhi tak koi nahi"
+            icon = "🟢" if await source_ok(cid) else "🔴"
+            out.append(f"{icon} {titles.get(cid, cid)} ({cid})\n    msgs {src_seen[cid]} | last: {ago}")
+        out.append("")
+    out.append(f"DB: {'🟢 OK' if db.ok else '🔴 DOWN'} | Userbot: {'🟢 OK' if await userbot_ok() else '🔴 DOWN'}")
+    await reply_long(e, "\n".join(out))
+
+
+# ---- per-pipeline: /<p>_add /<p>_remove /<p>_list
+def _make_add(p):
+    async def h(e):
+        tok = e.pattern_match.group(1)
+        if not tok:
+            return await e.reply(f"Use: /{p}_add <chat_id ya @username>", parse_mode=None)
+        if p not in PIPELINES:
+            return await e.reply(f"{p.title()} pipeline configure nahi hai (Railway variables check karo).", parse_mode=None)
+        try:
+            cid = await parse_chat(tok)
+            title = await resolve_title(cid)
+        except Exception:
+            return await e.reply("Userbot is channel me nahi hai ya ID/username galat hai.", parse_mode=None)
+        if not await db.upsert_source(cid, p, title):
+            return await e.reply("Supabase error, baad me try karo.", parse_mode=None)
+        sources[cid].add(p)
+        titles[cid] = title
+        await reload_handlers()
+        await e.reply(f"✅ {title} ({cid}) → {p.title()}", parse_mode=None)
+
+    return h
+
+
+def _make_remove(p):
+    async def h(e):
+        tok = e.pattern_match.group(1)
+        if not tok:
+            return await e.reply(f"Use: /{p}_remove <chat_id ya @username>", parse_mode=None)
+        try:
+            cid = await parse_chat(tok)
+        except Exception:
+            return await e.reply("Chat nahi mila.", parse_mode=None)
+        if p in ENV_SOURCES.get(cid, ()):
+            return await e.reply(
+                f"Ye source Railway variable ({p.upper()}_SOURCE_CHANNELS) se aa raha hai. "
+                "Hatane ke liye wahan se nikalo.",
+                parse_mode=None,
+            )
+        if not await db.delete_source(cid, p):
+            return await e.reply("Supabase error, baad me try karo.", parse_mode=None)
+        sources[cid].discard(p)
+        if not sources[cid]:
+            sources.pop(cid, None)
+        await reload_handlers()
+        await e.reply(f"🗑 {titles.get(cid, cid)} ({cid}) removed from {p.title()}", parse_mode=None)
+
+    return h
+
+
+def _make_list(p):
+    async def h(e):
+        srcs = [cid for cid, ps in sources.items() if p in ps]
+        if not srcs:
+            return await e.reply(f"{p.title()}: koi source nahi hai.", parse_mode=None)
+        lines = [f"{p.title()} sources ({len(srcs)}):"] + [f"• {titles.get(c, c)} ({c})" for c in srcs]
+        await reply_long(e, "\n".join(lines))
+
+    return h
+
+
+for _p in ALL_PIPELINES:
+    _arg = r"(?:\s+(\S+))?\s*$"
+    bot.add_event_handler(_make_add(_p), events.NewMessage(pattern=rf"^/{_p}_add(?:@\w+)?{_arg}", func=is_admin))
+    bot.add_event_handler(_make_remove(_p), events.NewMessage(pattern=rf"^/{_p}_remove(?:@\w+)?{_arg}", func=is_admin))
+    bot.add_event_handler(_make_list(_p), events.NewMessage(pattern=rf"^/{_p}_list(?:@\w+)?\s*$", func=is_admin))
 
 
 # ---------- main ----------
@@ -387,12 +525,7 @@ async def main():
         functions.bots.SetBotCommandsRequest(
             scope=types.BotCommandScopeDefault(),
             lang_code="",
-            commands=[
-                types.BotCommand("addsource", "Add source: pipeline chat_id"),
-                types.BotCommand("delsource", "Remove source: pipeline chat_id"),
-                types.BotCommand("sources", "List sources"),
-                types.BotCommand("report", "Live status"),
-            ],
+            commands=[types.BotCommand(c, d) for c, d in COMMANDS],
         )
     )
 
