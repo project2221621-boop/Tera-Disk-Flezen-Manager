@@ -2,9 +2,12 @@ import asyncio
 import io
 import logging
 import os
+import random
+import re
+import time
 from collections import defaultdict, deque
 
-from telethon import TelegramClient, events, functions, types, utils
+from telethon import TelegramClient, errors, events, functions, types, utils
 from telethon.sessions import StringSession
 
 import db
@@ -49,8 +52,9 @@ for _n in ("tera", "disk", "flezen"):
 
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2.5"))  # gap between sends to a converter
 POST_DELAY = float(os.getenv("POST_DELAY", "3"))  # gap between posts to a destination
-conv_locks = defaultdict(asyncio.Lock)  # one queue per converter (FIFO, keeps order)
-post_locks = defaultdict(asyncio.Lock)  # one queue per destination
+conv_q = defaultdict(asyncio.Queue)  # converter -> FIFO queue of source messages
+post_q = defaultdict(asyncio.Queue)  # destination -> FIFO queue of ready posts
+bg_tasks = []  # keep worker task refs alive
 
 user = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 bot = TelegramClient("bot_session", API_ID, API_HASH)
@@ -58,7 +62,7 @@ bot = TelegramClient("bot_session", API_ID, API_HASH)
 # ---------- state ----------
 sources = defaultdict(set)  # chat_id -> {pipeline}
 titles = {}
-stats = defaultdict(lambda: {"in": 0, "out": 0, "err": 0})
+stats = defaultdict(lambda: {"in": 0, "out": 0, "skip": 0, "err": 0})
 handlers = []  # (callback, event) currently attached to userbot
 
 _seen, _seen_set = deque(maxlen=5000), set()
@@ -128,48 +132,132 @@ async def refresh_loop():
 
 
 # ---------- pipeline: source -> converter -> destination ----------
+URL_RE = re.compile(r"https?://\S+|t\.me/\S+", re.I)
+PERMANENT = tuple(
+    getattr(errors, n)
+    for n in (
+        "ChatWriteForbiddenError", "ChatAdminRequiredError", "UserIsBlockedError", "ChannelPrivateError",
+        "PeerIdInvalidError", "ChatIdInvalidError", "MediaEmptyError", "PhotoInvalidError",
+    )
+    if hasattr(errors, n)
+)
+
+
+def pace(d: float) -> float:
+    """Natural-looking gap: base delay with random jitter."""
+    return d * random.uniform(0.8, 1.4)
+
+
+def has_link(msg) -> bool:
+    if URL_RE.search(msg.raw_text or ""):
+        return True
+    return any(isinstance(e, (types.MessageEntityTextUrl, types.MessageEntityUrl)) for e in (msg.entities or []))
+
+
+async def with_retry(fn, what: str, attempts: int = 6):
+    """FloodWait: wait exactly as told, retry forever. Other errors: backoff, up to `attempts`.
+    Permanent errors (not admin, blocked, etc.) raise immediately."""
+    n = 0
+    while True:
+        try:
+            return await fn()
+        except errors.FloodWaitError as e:
+            log.warning("FloodWait %ss (%s), wait karke retry", e.seconds, what)
+            await asyncio.sleep(e.seconds + 2)
+        except PERMANENT:
+            raise
+        except Exception as e:
+            n += 1
+            if n >= attempts:
+                raise
+            wait = min(2**n * 2, 120)
+            log.warning("%s failed (%s), retry %d/%d in %ss", what, e, n, attempts, wait)
+            await asyncio.sleep(wait)
+
+
 async def on_source(event):
     msg = event.message
     for p in list(sources.get(event.chat_id, ())):
         if p not in PIPELINES or dup(("src", p, event.chat_id, msg.id)):
             continue
+        conv_q[PIPELINES[p]["converter"]].put_nowait((p, event.chat_id, msg, time.monotonic()))
+
+
+async def conv_worker(conv):
+    """One at a time, in order, with natural pacing."""
+    q = conv_q[conv]
+    while True:
+        p, chat_id, msg, t0 = await q.get()
         try:
-            conv = PIPELINES[p]["converter"]
-            async with conv_locks[conv]:
-                await user.send_message(conv, msg)
-                await asyncio.sleep(SEND_DELAY)
+            if time.monotonic() - t0 > 600:  # long-queued: refresh stale file reference
+                fresh = await with_retry(lambda: user.get_messages(chat_id, ids=msg.id), f"refetch:{p}")
+                msg = fresh or msg
+            await with_retry(lambda: user.send_message(conv, msg), f"conv:{p}")
             stats[p]["in"] += 1
         except Exception:
             stats[p]["err"] += 1
-            log.exception("send to converter failed (%s)", p)
+            log.exception("converter send failed (%s)", p)
+        finally:
+            q.task_done()
+        await asyncio.sleep(pace(SEND_DELAY))
 
 
 async def on_reply(event):
-    """Converter reply is self-contained: post it as-is to the pipeline's destination."""
+    """Converter reply -> post only if it has image + caption + link. Everything else is skipped."""
     msg = event.message
     p = next((k for k, v in PIPELINES.items() if v["conv_id"] == event.sender_id), None)
     if not p or dup(("rep", p, msg.id)):
         return
-    dest = PIPELINES[p]["dest"]
+    text = msg.raw_text or ""  # raw_text matches msg.entities offsets (msg.text does not)
+    if not (msg.photo and text.strip() and has_link(msg)):
+        stats[p]["skip"] += 1
+        log.info("Skip (%s): image+caption+link teeno nahi hain", p)
+        return
     try:
-        async with post_locks[dest]:
-            if PIPELINES[p]["via_user"]:
-                await user.send_message(dest, msg)  # re-sends text + media as-is
-            elif msg.photo or msg.document:
-                buf = io.BytesIO()
-                await user.download_media(msg, file=buf)
-                buf.seek(0)
-                buf.name = "file.jpg" if msg.photo else (msg.file.name or "file")
-                await bot.send_file(dest, buf, caption=msg.text or "", formatting_entities=msg.entities)
-            elif msg.text:
-                await bot.send_message(dest, msg.text, formatting_entities=msg.entities, link_preview=False)
-            else:
-                return
-            await asyncio.sleep(POST_DELAY)
-        stats[p]["out"] += 1
+        # download now (small), so queue wait can't break an expired file reference
+        data = await with_retry(lambda: user.download_media(msg, file=bytes), f"download:{p}")
+        if not data:
+            raise RuntimeError("empty download")
     except Exception:
         stats[p]["err"] += 1
-        log.exception("post to destination failed (%s)", p)
+        log.exception("image download failed (%s)", p)
+        return
+    post_q[PIPELINES[p]["dest"]].put_nowait((p, data, text, msg.entities))
+
+
+async def deliver(p, data, text, ents):
+    c = PIPELINES[p]
+    dest = c["dest"]
+    sender = user if c["via_user"] else bot  # bots can't message bots
+
+    def img():
+        b = io.BytesIO(data)
+        b.name = "image.jpg"
+        return b
+
+    if len(text) <= 1024:  # Telegram photo-caption limit
+        await with_retry(lambda: sender.send_file(dest, img(), caption=text, formatting_entities=ents), f"post:{p}")
+    else:  # caption too long: image first, full text right after
+        await with_retry(lambda: sender.send_file(dest, img()), f"post:{p}")
+        await with_retry(
+            lambda: sender.send_message(dest, text, formatting_entities=ents, link_preview=False), f"post:{p}"
+        )
+
+
+async def post_worker(dest):
+    """One at a time, in order, with natural pacing."""
+    q = post_q[dest]
+    while True:
+        p, data, text, ents = await q.get()
+        try:
+            await deliver(p, data, text, ents)
+            stats[p]["out"] += 1
+        except Exception:
+            stats[p]["err"] += 1
+            log.exception("post failed (%s)", p)
+        finally:
+            q.task_done()
+        await asyncio.sleep(pace(POST_DELAY))
 
 
 async def on_deleted(event):
@@ -245,7 +333,8 @@ async def cmd_report(e):
         out.append(
             f"**{p.upper()}** → `{c['dest']}`\n"
             f"Sources ({len(srcs)}): {', '.join(srcs) or '—'}\n"
-            f"In {s['in']} | Out {s['out']} | Err {s['err']}"
+            f"In {s['in']} | Out {s['out']} | Skip {s['skip']} | Err {s['err']} | "
+            f"Queue {conv_q[c['converter']].qsize() + post_q[c['dest']].qsize()}"
         )
     out.append(f"DB: {'OK' if db.ok else 'DOWN'} | Userbot: {'OK' if user.is_connected() else 'DOWN'}")
     await e.reply("\n\n".join(out))
@@ -307,9 +396,14 @@ async def main():
         )
     )
 
+    for conv in {c["converter"] for c in PIPELINES.values()}:
+        bg_tasks.append(asyncio.create_task(conv_worker(conv)))
+    for dest in {c["dest"] for c in PIPELINES.values()}:
+        bg_tasks.append(asyncio.create_task(post_worker(dest)))
+
     await sync_sources()
     await reload_handlers()
-    asyncio.create_task(refresh_loop())
+    bg_tasks.append(asyncio.create_task(refresh_loop()))
     log.info("Running. Pipelines: %s", ", ".join(PIPELINES))
     await asyncio.gather(user.run_until_disconnected(), bot.run_until_disconnected())
 
