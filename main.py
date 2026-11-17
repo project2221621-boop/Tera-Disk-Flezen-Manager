@@ -384,7 +384,7 @@ async def parse_chat(tok: str) -> int:
 async def cmd_start(e):
     status = "🟢 Connected" if await userbot_ok() else "🔴 Disconnected"
     await e.reply(
-        "XVIP Hybrid Bot\n\n"
+        "Tera Disk Flezen Manager\n\n"
         f"Userbot Status: {status}\n\n"
         "Commands:\n"
         "/status — account/login status\n"
