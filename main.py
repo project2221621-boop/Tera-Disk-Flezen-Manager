@@ -1,4 +1,5 @@
 import asyncio
+import html
 import io
 import logging
 import os
@@ -293,7 +294,24 @@ for _p in ALL_PIPELINES:
         (f"{_p}_list", f"List {_p.title()} sources"),
     ]
 
-_ok_cache = {}  # chat_id -> (ts, ok)
+_state_cache = {}  # chat_id -> (ts, "ok" | "dead" | "unknown")
+ICON = {"ok": "✅", "dead": "❌", "unknown": "⚠️"}
+DEAD_ERRORS = tuple(
+    getattr(errors, n)
+    for n in (
+        "ChannelPrivateError", "ChannelInvalidError", "ChannelBannedError", "PeerIdInvalidError",
+        "ChatIdInvalidError", "UsernameInvalidError", "UsernameNotOccupiedError", "ChatForbiddenError",
+    )
+    if hasattr(errors, n)
+) + (ValueError,)  # ValueError = entity no longer resolvable
+
+
+def code(x) -> str:
+    return f"<code>{html.escape(str(x))}</code>"
+
+
+def esc(x) -> str:
+    return html.escape(str(x))
 
 
 def fmt_dur(sec: float) -> str:
@@ -305,15 +323,15 @@ def fmt_dur(sec: float) -> str:
 
 
 async def reply_long(e, text: str):
-    """Plain text (no markdown: titles/underscores stay safe), split under Telegram's 4096 limit."""
+    """HTML reply (callers escape titles; ids go in <code>), split under Telegram's 4096 limit."""
     chunk = ""
     for line in text.split("\n"):
         if len(chunk) + len(line) + 1 > 3900:
-            await e.reply(chunk, parse_mode=None)
+            await e.reply(chunk, parse_mode="html")
             chunk = ""
         chunk += line + "\n"
     if chunk.strip():
-        await e.reply(chunk, parse_mode=None)
+        await e.reply(chunk, parse_mode="html")
 
 
 async def userbot_ok() -> bool:
@@ -323,18 +341,31 @@ async def userbot_ok() -> bool:
         return False
 
 
-async def source_ok(cid: int) -> bool:
-    """Can the userbot still read this source? (cached 60s so /report can't spam the API)"""
-    ts, ok = _ok_cache.get(cid, (0, False))
-    if time.time() - ts < 60:
-        return ok
+async def source_state(cid: int) -> str:
+    """✅ ok = userbot can read it | ❌ dead = deleted/removed/kicked | ⚠️ unknown = temporary check failure.
+    Cached 60s so /report and /list can't spam the API."""
+    ts, st = _state_cache.get(cid, (0, "unknown"))
+    if time.time() - ts < 60 and st != "unknown":
+        return st
     try:
         await asyncio.wait_for(user.get_messages(cid, limit=1), 10)
-        ok = True
+        st = "ok"
+    except DEAD_ERRORS:
+        st = "dead"
     except Exception:
-        ok = False
-    _ok_cache[cid] = (time.time(), ok)
-    return ok
+        pass  # transient (timeout/flood/network): keep last known state
+    _state_cache[cid] = (time.time(), st)
+    return st
+
+
+async def source_states(cids) -> dict:
+    sem = asyncio.Semaphore(5)
+
+    async def one(c):
+        async with sem:
+            return c, await source_state(c)
+
+    return dict(await asyncio.gather(*(one(c) for c in cids)))
 
 
 async def parse_chat(tok: str) -> int:
@@ -373,39 +404,45 @@ async def cmd_status(e):
         try:
             me = await user.get_me()
             name = " ".join(x for x in (me.first_name, me.last_name) if x) or "-"
-            lines.append(f"Account: {name}" + (f" (@{me.username})" if me.username else "") + f" | id {me.id}")
+            lines.append(f"Account: {esc(name)}" + (f" (@{esc(me.username)})" if me.username else "") + f" | id {code(me.id)}")
         except Exception:
             pass
     try:
-        lines.append(f"Bot: @{(await bot.get_me()).username}")
+        lines.append(f"Bot: @{esc((await bot.get_me()).username)}")
     except Exception:
         pass
     lines.append(f"Database: {'🟢 OK' if db.ok else '🔴 DOWN'}")
-    lines.append("Pipelines: " + (", ".join(PIPELINES) or "none"))
+    lines.append("Pipelines: " + esc(", ".join(PIPELINES) or "none"))
     lines.append(f"Sources: {len(sources)}")
     lines.append(f"Uptime: {fmt_dur(time.time() - START_TS)}")
-    await e.reply("\n".join(lines), parse_mode=None)
+    await e.reply("\n".join(lines), parse_mode="html")
 
 
 @bot.on(events.NewMessage(pattern=r"^/report", func=is_admin))
 async def cmd_report(e):
     now = time.time()
+    states = await source_states(list(sources))
     out = []
     for p, c in PIPELINES.items():
-        s = stats[p]
+        st = stats[p]
         q = conv_q[c["converter"]].qsize() + post_q[c["dest"]].qsize()
-        out.append(
-            f"━━ {p.upper()} ━━\n→ {c['dest']}\n"
-            f"In {s['in']} | Out {s['out']} | Skip {s['skip']} | Err {s['err']} | Queue {q}"
-        )
         srcs = [cid for cid, ps in sources.items() if p in ps]
+        live = sum(states[c_] == "ok" for c_ in srcs)
+        dead = sum(states[c_] == "dead" for c_ in srcs)
+        out.append(
+            f"━━ {p.upper()} ━━\n→ {code(c['dest'])}\n"
+            f"In {st['in']} | Out {st['out']} | Skip {st['skip']} | Err {st['err']} | Queue {q}\n"
+            f"Sources: {len(srcs)} (✅ {live} | ❌ {dead})"
+        )
         if not srcs:
             out.append("(koi source nahi)")
         for cid in srcs:
             last = src_last.get(cid)
             ago = f"{fmt_dur(now - last)} ago" if last else "abhi tak koi nahi"
-            icon = "🟢" if await source_ok(cid) else "🔴"
-            out.append(f"{icon} {titles.get(cid, cid)} ({cid})\n    msgs {src_seen[cid]} | last: {ago}")
+            out.append(
+                f"{ICON[states[cid]]} {esc(titles.get(cid, cid))} ({code(cid)})\n"
+                f"    msgs {src_seen[cid]} | last: {ago}"
+            )
         out.append("")
     out.append(f"DB: {'🟢 OK' if db.ok else '🔴 DOWN'} | Userbot: {'🟢 OK' if await userbot_ok() else '🔴 DOWN'}")
     await reply_long(e, "\n".join(out))
@@ -429,7 +466,7 @@ def _make_add(p):
         sources[cid].add(p)
         titles[cid] = title
         await reload_handlers()
-        await e.reply(f"✅ {title} ({cid}) → {p.title()}", parse_mode=None)
+        await e.reply(f"✅ {esc(title)} ({code(cid)}) → {p.title()}", parse_mode="html")
 
     return h
 
@@ -455,7 +492,7 @@ def _make_remove(p):
         if not sources[cid]:
             sources.pop(cid, None)
         await reload_handlers()
-        await e.reply(f"🗑 {titles.get(cid, cid)} ({cid}) removed from {p.title()}", parse_mode=None)
+        await e.reply(f"🗑 {esc(titles.get(cid, cid))} ({code(cid)}) removed from {p.title()}", parse_mode="html")
 
     return h
 
@@ -465,7 +502,13 @@ def _make_list(p):
         srcs = [cid for cid, ps in sources.items() if p in ps]
         if not srcs:
             return await e.reply(f"{p.title()}: koi source nahi hai.", parse_mode=None)
-        lines = [f"{p.title()} sources ({len(srcs)}):"] + [f"• {titles.get(c, c)} ({c})" for c in srcs]
+        states = await source_states(srcs)
+        live = sum(v == "ok" for v in states.values())
+        dead = sum(v == "dead" for v in states.values())
+        lines = [f"{p.title()} sources ({len(srcs)}) — ✅ {live} live | ❌ {dead} deleted"]
+        # live first, deleted last
+        for cid in sorted(srcs, key=lambda c: states[c] == "dead"):
+            lines.append(f"{ICON[states[cid]]} {esc(titles.get(cid, cid))} — {code(cid)}")
         await reply_long(e, "\n".join(lines))
 
     return h
